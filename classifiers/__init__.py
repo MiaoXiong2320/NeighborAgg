@@ -12,18 +12,14 @@ def get_base_classifier(classifier_name):
     """
     
     if "resnet" in classifier_name:
-        if "selfconfid_classic" in classifier_name:
-            from classifiers.resnet_confidnet import ResnetSelfConfidClassic
-            return ResnetSelfConfidClassic(feature_dim=512)
-        else:
-            from classifiers import resnet_cifar, resnet_mnist
-            model_factory = {
-                "resnet50_cifar": resnet_cifar.ResNet50,
-                "resnet18_cifar": resnet_cifar.ResNet18,
-                "resnet18_mnist": resnet_mnist.ResNet18,
+        from classifiers import resnet_cifar, resnet_mnist
+        model_factory = {
+            "resnet50_cifar": resnet_cifar.ResNet50,
+            "resnet18_cifar": resnet_cifar.ResNet18,
+            "resnet18_mnist": resnet_mnist.ResNet18,
 
-            }
-            return model_factory[classifier_name]()
+        }
+        return model_factory[classifier_name]()
 
     else:
         # Available models

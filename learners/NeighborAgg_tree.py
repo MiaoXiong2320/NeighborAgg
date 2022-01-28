@@ -1,129 +1,292 @@
+"""
+Our main method NeighborAgg.
+"""
 import numpy as np
-from sklearn.neighbors import KDTree
-from sklearn.neighbors import KNeighborsClassifier
+import random, torch
+import torch.nn.functional as F
+seed = 2021
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
+
+import sys, os
+sys.path.append("../")
+
+from methods.neighbor_base import NeighborBase
+from models.classification import atten_Classification_act
+import nni
 import pdb
 
 
-class NeighborBase(object):
-    def __init__(self, args, min_dist=1e-12):
-        """
-            k and alpha are the tuning parameters for the filtering,
-            filtering: method of filtering. option are "none", "density",
-            "uncertainty"
-            min_dist: some small number to mitigate possible division by 0.
-        """
-        self.args = args
-        self.dataset_name = args['ds']
-        self.val_k = args['val_k']  # the number of neighbors queried
-        self.filter_k = 10  # used for abnormal neighbor filtering
-        self.min_dist = min_dist  # used for abnormal neighbor filtering
-        self.filtering = args['filtering']  # filtering method
-        self.alpha = args['TS_alpha']  # percentage of abnormal neighbors filtered
+class NeighborAgg(NeighborBase):
 
-        self.by_class = args['kdtree_by_class']
+  def __init__(self, args):
+    """
+    input:
+        self.by_class = args['kdtree_by_class'] -> indicate whether to build KDTree by its class, otherwise build a whole KDTree
+        k and alpha are the tuning parameters for the filtering,
+        filtering: method of filtering. option are "none", "density",
+        "uncertainty"
+        min_dist: some small number to mitigate possible division by 0.
+    """
+    super(NeighborAgg, self).__init__(args)
 
-        self.temp = args['similarity_T']
-        self.sim_kernel = (self.temp is not None)
-        print("using similarity kernels with temperature {}".format(self.temp))
+    self.object_name = "NeighborAgg"
+    print("{} init...".format(self.object_name))
 
-    def filter_by_density(self, X):
-        """Filter out points with low kNN density.
-        Args:
-        X: an array of sample points.
+    # self.by_class must be true
+    self.by_class = True
 
-        Returns:
-        A subset of the array without points in the bottom alpha-fraction of
-        original points of kNN density.
-        """
-        kdtree = KDTree(X)
-        knn_radii = kdtree.query(X, self.filter_k)[0][:, -1]
-        eps = np.percentile(knn_radii, (1 - self.alpha) * 100)
-        return X[np.where(knn_radii <= eps)[0], :]
+    self.num_epochs = args['num_epochs']
+    
 
-    def filter_by_uncertainty(self, X, y):
-        """Filter out points with high label disagreement amongst its kNN neighbors.
-        Args:
-        X: an array of sample points.
+  def fit_learnable(self, X_val, y_val, y_softmax_vec):
+    """train a learnable function on the validation set"""
+    trust_vec_val = self.get_neighbor_vec(X_val)  ### ----> h_i's: (N, CK)
 
-        Returns:
-        A subset of the array without points in the bottom alpha-fraction of
-        samples with highest disagreement amongst its k nearest neighbors.
-        """
-        neigh = KNeighborsClassifier(n_neighbors=self.filter_k)
-        neigh.fit(X, y)
-        confidence = neigh.predict_proba(X)
-        confidence = confidence[range(y.shape[0]), y]
-        cutoff = np.percentile(confidence, self.alpha * 100)
-        unfiltered_idxs = np.where(confidence >= cutoff)[0]
-        return X[unfiltered_idxs, :], y[unfiltered_idxs]
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    def fit(self, X, y):
-        """use training data to build a KD-Tree.
+    # self.emb_size = self.n_labels*self.val_k + self.n_labels
+    
+    classification = atten_Classification_act(self.n_labels*self.val_k, self.n_labels, self.n_labels, self.args).to(device)
+    y_softmax_vec = torch.tensor(y_softmax_vec, dtype=torch.float).to(device) # p_i
+    trust_vec_val = torch.tensor(trust_vec_val, dtype=torch.float).to(device) # h_i
+    y_val = torch.tensor(y_val, dtype=torch.long).to(device) # y_i
+    
+    if self.args['optimizer'] == "Adam":
+        optimizer = torch.optim.Adam(classification.parameters(), lr=self.args['lr'], weight_decay=self.args['weight_decay'])
+    elif self.args['optimizer'] == "SGD":
+        optimizer = torch.optim.SGD(classification.parameters(), lr=self.args['lr'], momentum=0.9, weight_decay=self.args['weight_decay'])
 
-        WARNING: assumes that the labels are 0-indexed (i.e.
-        0, 1,..., n_labels-1).
+    # optimizer = torch.optim.SGD(classification.parameters(), lr=0.1,
+    #                     momentum=0.9, weight_decay=5e-4)
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
+    # optimizer = torch.optim.SGD(params, lr=0.7)
 
-        Args:
-        X: an array of sample points.
-        y: corresponding labels.
-        """
-        self.n_labels = np.max(y) + 1
+    classification.train()
+    torch.set_grad_enabled(True) 
+    loss_list = []
+    ap_errors = []
+    for epoch in range(self.num_epochs):
+        optimizer.zero_grad()
+        # feature = torch.cat([trust_vec_val, y_softmax_vec], dim=1)
+        out = classification(trust_vec_val, y_softmax_vec)
+        # pdb.set_trace()
+        loss = F.nll_loss(out, y_val)
+        loss_list.append(loss)
+        loss.backward()
+        optimizer.step()
 
-        if self.by_class:
-            self.kdtree = [None] * self.n_labels
-            if self.filtering == "uncertainty":
-                X_filtered, y_filtered = self.filter_by_uncertainty(X, y)
-            # in the training dataset, for every label, build a KD-Tree
-            for label in range(self.n_labels):
-                if self.filtering == "none":
-                    X_to_use = X[np.where(y == label)[0]]
-                elif self.filtering == "density":
-                    X_to_use = self.filter_by_density(X[np.where(y == label)[0]])
-                elif self.filtering == "uncertainty":
-                    X_to_use = X_filtered[np.where(y_filtered == label)[0]]
+    # plt.plot(np.arange(len(loss_list)), ap_errors, color='red')
+    # plt.title("{} ap_errors".format(self.graph_model_name))
+    # plt.show()
+    # # os.makedirs("plt_output/", exist_ok=True)
+    # plt.savefig(os.path.join("plt_output/", "{}.png".format(self.graph_model_name+"ap_errorsLR")))
+    # plt.close()
 
-                if len(X_to_use) == 0:
-                    print("Filtered too much or missing examples from a label! Please lower alpha or check data.")
-                self.kdtree[label] = KDTree(X_to_use)
+    # import matplotlib.pyplot as plt
+    # plt.plot(np.arange(len(loss_list)), loss_list)
+    # plt.title("{} 2input loss function".format(self.dataset_name))
+    # plt.show()
+    # plt.savefig("../output/plt_output/LR_2input")
+    # plt.close()
 
-        else:
-            if self.filtering == "none":
-                X_to_use = X
-            elif self.filtering == "density":
-                X_to_use = self.filter_by_density(X)
-            elif self.filtering == "uncertainty":
-                X_filtered, y_filtered = self.filter_by_uncertainty(X, y)
-                X_to_use = X_filtered
+    # torch.save(classification.state_dict(), '../output/2inputNN_act_{}.pth'.format(self.dataset_name))
+    
 
-            if len(X_to_use) == 0:
-                print("Filtered too much or missing examples from a label! Please lower alpha or check data.")
-            else:
-                ratio = len(X_to_use) / len(X)
-                print("{:.2%} has been filtered out.".format(1 - ratio))
-            self.kdtree = KDTree(X_to_use)
+    self.classification = classification
+    print("{} training done.".format(self.object_name))
 
-        print("Building KDTree done.")
 
-    def get_neighbor_vec(self, X):
-        if self.by_class:
-            d = np.tile(None, (X.shape[0], self.n_labels, self.val_k))
-            # for every label, compute every test sample's NN?
-            for label_idx in range(self.n_labels):
-                try:
-                    d[:, label_idx, :] = self.kdtree[label_idx].query(X, k=self.val_k)[0][:, :self.val_k]
-                except:
-                    # one class's number of samples is less than self.val_k
-                    k = self.kdtree[label_idx].data.shape[0]
-                    d[:, label_idx, :k] = self.kdtree[label_idx].query(X, k=k)[0][:, :k]
-                    print("one class's number of samples is less than self.val_k")
-            d = d.reshape((d.shape[0], -1)).astype(np.float)
-        else:
-            num_neighbors = self.n_labels * self.val_k
-            d = np.tile(None, (X.shape[0], num_neighbors))
-            d[:, :] = self.kdtree.query(X, k=num_neighbors)[0][:, :num_neighbors]
-            d = d.reshape((d.shape[0], -1)).astype(np.float)
+  def get_score(self, X, y_pred, y_softmax_vec):
+    """
+    requires datashape: tensor
+    1. use GNN to compute sample's embedding
+    2. concatenate this embedding with sample's softmax vector
+    3. using classification layer to compute its new softmax output
+    4. fetch the given class's corresponding score -> softmax score
+    """
+    torch.set_grad_enabled(False) 
+    if not torch.is_tensor(y_softmax_vec):
+      y_softmax_vec = torch.tensor(y_softmax_vec, dtype=torch.float).cuda()
 
-        if self.sim_kernel:
-            d = np.exp(-d.astype(np.float) / self.temp)
-        return d
+    trust_vec_test = self.get_neighbor_vec(X)
+    trust_vec_test = torch.tensor(trust_vec_test, dtype=torch.float).cuda()
+    
+    # feature = torch.cat([trust_vec_test, y_softmax_vec], dim=1)
+    pred = self.classification(trust_vec_test, y_softmax_vec).cpu().numpy()
+    pred = np.exp(pred)
+    score = pred[range(len(y_pred)), y_pred]
+    # try:
+    #   assert np.sum(np.exp(pred), axis=1) > 0.9 and np.sum(np.exp(pred), axis=1) < 1.1
+    # except:
+    #   print(np.sum(np.exp(pred), axis=1))
+    #   print("GNN score is not normal")
+    return score
+  def get_Wp_Wh(self):
+    wh = self.classification.fc1.weight.detach().cpu().numpy()
+    wp = self.classification.fc2.weight.detach().cpu().numpy()
+    return wh, wp
 
+  def get_final_para(self):
+    wh = self.classification.fc1.weight.detach().cpu().numpy()
+    wp = self.classification.fc2.weight.detach().cpu().numpy()
+    w = self.classification.layers.weight.detach().cpu().numpy()
+    return wh, wp, w
+
+  def get_prediction(self, X, y_softmax_vec):
+    """
+    Based on the probability provided by the learnable function, return the class with maximum probability
+    """
+    pass
+
+  def get_softmax_output(self, X, y_softmax_vec):
+    """
+    Based on the probability provided by the learnable function, return the class with maximum probability
+    """
+    pass
+
+
+if __name__ == '__main__':
+  from sklearn import datasets
+  from ucimlr import classification_datasets
+  from sklearn.model_selection import train_test_split
+
+
+  # params = {
+  #         "similarity_T": 10,
+  #         "gpu_ids": 1,
+  #         "is_nni": True,
+  #         "num_epochs": 800,
+  #         "mode": "simple_version_tabular", #["simple_version_image"]
+  #         "classifier": "LR", #["LR", "RF", "SVC", "KNN", "MLP"], # "NN"
+  #         "trust_model": "XGB", # ["LR", "RF", "SVC"],
+  #         "baseline": "TCP", # "ablation", # ["MCP", "Calibration", "SoftmaxOnly", "TrustOnly", "Trust Score", "Trust Score Learnable","Trust Score GNN 2", "Trust Score GNN 3", "Trust Score LR"]
+  #         "save_name": "",
+  #         "TS_alpha": 0.0625,
+  #         "val_k": 10,
+  #         "power_degree": 1.28,
+  #         "lr": 0.005,
+
+  #         'with_softmax_feature': True,
+
+  #         "filtering": "density", # "density", "none", "uncertainty"
+
+  #         "kdtree_by_class": True, # whether to build K kdtrees or just one kdtree
+
+  #         "ds": "Adult",
+  #         'slope': 0,
+  #         'is_more_layer': False
+  # }
+
+  params = {
+          'similarity_T': 10,
+          "gpu_ids": 0,
+          "is_nni": True,
+          "num_epochs": 200,
+          "mode": "simple_version_tabular", #["simple_version_image"]
+          "classifier": "MLP", #["LR", "RF", "SVC", "KNN", "MLP"], # "NN"
+          "baseline": "NeighborAgg", # "ablation", # ["MCP", "Calibration", "SoftmaxOnly", "TrustOnly", "Trust Score", "Trust Score Learnable","Trust Score GNN 2", "Trust Score GNN 3", "Trust Score LR"]
+          "save_name": "",
+          "TS_alpha": 0.0625,
+          "val_k": 5,
+          "power_degree": 1.28,
+
+          "optimizer": "Adam",
+          "lr": 0.05,
+          "weight_decay": 5e-4,
+          "pool_type": "mean", #["nearest"]
+          "GNN_dim": 18,
+
+          'with_softmax_feature': True,
+
+
+          "fair_train":True,
+          "filtering": "density", # "density", "none", "uncertainty"
+
+          "graph_model": "GCNNet_3conv", # "SGConvNet_1layer", GatedGraphConvNet", "GMMConvNet","GCNNet", "NNConvNet", "CGConvNet", "TransformerConvNet","GMMConvNet"
+          "kdtree_by_class": True, # whether to build K kdtrees or just one kdtree
+
+          "ds":  "Landsat", #"Landsat",
+
+          "split": 1,
+          "slope": 0.1,
+          "is_more_layer": False,
+
+          # "dataset": ["Iris", "Digits", "Bankruptcy"], 
+          "dataset": None, #["Adult", "BankMarketing", "CardDefault", "Landsat", "LetterRecognition", "MagicGamma", "SensorLessDrive", "Shuttle"] # ["Adult", "Avila"
+          # Bankruptcy dataset comes from kaggle and needs downloading -> data imbalance, 3410 samples(110 positive)
+
+          "writer": None
+  }
+
+  if params['is_nni']:
+          import nni
+          from nni.utils import merge_parameter
+
+
+  if params['is_nni']:
+          tuner_params = nni.get_next_parameter()
+          print(tuner_params)
+          params = merge_parameter(params, tuner_params)
+          print(params)
+
+
+  datasets = [params['ds']] #["CardDefault"] 
+  for dataset_name in datasets:
+    dset = getattr(classification_datasets, dataset_name)
+    dataset = dset("dataset")
+    X = dataset[:][0]
+    y = dataset[:][1]
+    num_classes = np.max(y) + 1
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=0.4, random_state=42)
+
+    from sklearn.linear_model import LogisticRegression
+    # Train logistic regression on digits.
+    # model = RandomForestClassifier()
+    model = LogisticRegression(max_iter=1000)
+    model.fit(X_train, y_train)
+    train_softmax = model.predict_proba(X_train)
+    softmax_vac = model.predict_proba(X_val)
+    test_softmax = model.predict_proba(X_test)
+
+    # from tensorboardX import SummaryWriter
+    # import time
+    # # time_stamp = time.strftime("%m%d-%H%M%S", time.localtime())
+    # writer = SummaryWriter(log_dir=os.path.join("../output/tb",dataset_name))
+
+    # args = {
+    #   "kdtree_by_class":True,
+    #   "num_epochs": 800,
+    #   "filtering": "density",
+    #   "TS_alpha": 0.0625,
+    #   "ds": dataset_name,
+    #   "writer": None
+    # }
+
+    score_model = NeighborAgg(params)
+    # from trustscore_LR_2input import TrustScore_LR
+    # score_model = TrustScore_LR(params, k=10, alpha=0.0625, filtering="none", min_dist=1e-12)
+    score_model.fit(X_train, y_train)
+    score_model.fit_learnable(X_val, y_val, softmax_vac)
+
+    wh, wp = score_model.get_Wp_Wh()
+    pdb.set_trace()
+
+    # trust_score = score_model.get_score(X_test, model.predict(X_test), model.predict_proba(X_test))
+
+    # import sys, os, sklearn
+    # sys.path.append("../")
+    # from models.classification import Classification
+    # from utils.metrics import Metrics, compute_average_metrics
+    # from utils.metric_diff import compute_metric_diff
+    # metrics_to_use = ['auc_roc', 'ap_success', 'ap_errors', "fpr_at_95tpr"] # , "fpr_at_95tpr" has bugs!
+    # test_pred = model.predict(X_test)
+    # metrics = Metrics(metrics_to_use, X_test.shape[0], num_classes)
+    # metrics.update(test_pred, y_test, trust_score)
+    # scores = metrics.get_scores(split="test")
+    # print(scores) 
+    # nni.report_final_result(scores['test/ap_errors']['value'])

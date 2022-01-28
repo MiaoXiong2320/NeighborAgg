@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+cd ../
+
 DATASET="cifar10"
 
 BASE_CLF="resnet50_cifar"
